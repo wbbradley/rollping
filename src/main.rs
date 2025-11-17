@@ -93,31 +93,36 @@ async fn main() -> Result<()> {
     );
 
     // Initialize geolocation (only if --geo flag is set)
+    // Use spawn_blocking to avoid blocking the async runtime
     let location = if args.geo {
-        let geoip_client = GeoIpClient::new();
-        if geoip_client.is_available() {
-            match geoip::get_public_ip() {
-                Ok(ip) => {
-                    info!("Detected public IP: {}", ip);
-                    let loc = geoip_client.lookup(ip);
-                    if let Some(ref l) = loc {
-                        info!(
-                            "Current location: {:?}, {:?}, {:?}",
-                            l.city.as_deref().unwrap_or("Unknown"),
-                            l.country.as_deref().unwrap_or("Unknown"),
-                            l.country_code.as_deref().unwrap_or("??")
-                        );
+        tokio::task::spawn_blocking(|| {
+            let geoip_client = GeoIpClient::new();
+            if geoip_client.is_available() {
+                match geoip::get_public_ip() {
+                    Ok(ip) => {
+                        info!("Detected public IP: {}", ip);
+                        let loc = geoip_client.lookup(ip);
+                        if let Some(ref l) = loc {
+                            info!(
+                                "Current location: {:?}, {:?}, {:?}",
+                                l.city.as_deref().unwrap_or("Unknown"),
+                                l.country.as_deref().unwrap_or("Unknown"),
+                                l.country_code.as_deref().unwrap_or("??")
+                            );
+                        }
+                        loc
                     }
-                    loc
+                    Err(e) => {
+                        warn!("Failed to detect public IP: {}", e);
+                        None
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to detect public IP: {}", e);
-                    None
-                }
+            } else {
+                None
             }
-        } else {
-            None
-        }
+        })
+        .await
+        .unwrap_or(None)
     } else {
         None
     };
@@ -210,7 +215,9 @@ async fn ping_host(host: &str, count: usize, timeout_duration: Duration) -> Host
         Ok(c) => c,
         Err(e) => {
             error!("Failed to create ping client for {}: {}", host, e);
-            return HostResult { best_time_microsecs: None };
+            return HostResult {
+                best_time_microsecs: None,
+            };
         }
     };
 
@@ -222,7 +229,8 @@ async fn ping_host(host: &str, count: usize, timeout_duration: Duration) -> Host
             Ok(Ok(rtt)) => {
                 let rtt_microsecs = rtt.as_secs_f64() * 1_000_000.0;
                 debug!("Host {} ping #{}: {:.0}µs", host, i + 1, rtt_microsecs);
-                min_time_microsecs = Some(min_time_microsecs.map_or(rtt_microsecs, |min| min.min(rtt_microsecs)));
+                min_time_microsecs =
+                    Some(min_time_microsecs.map_or(rtt_microsecs, |min| min.min(rtt_microsecs)));
                 successful_pings += 1;
             }
             Ok(Err(e)) => {
@@ -278,9 +286,15 @@ fn calculate_statistics(
         .unwrap()
         .as_secs();
 
-    let mut successful_times: Vec<f64> = results.iter().filter_map(|r| r.best_time_microsecs).collect();
+    let mut successful_times: Vec<f64> = results
+        .iter()
+        .filter_map(|r| r.best_time_microsecs)
+        .collect();
 
-    let non_responsive_nodes = results.iter().filter(|r| r.best_time_microsecs.is_none()).count();
+    let non_responsive_nodes = results
+        .iter()
+        .filter(|r| r.best_time_microsecs.is_none())
+        .count();
     let total_hosts = results.len();
 
     if successful_times.is_empty() {
