@@ -3,7 +3,7 @@ mod geoip;
 use std::{
     io::{self, BufRead},
     net::ToSocketAddrs,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -37,16 +37,18 @@ struct Args {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Statistics {
-    /// Average ping time in milliseconds
-    avg_ms: f64,
-    /// Median ping time in milliseconds
-    median_ms: f64,
-    /// 95th percentile ping time in milliseconds
-    p95_ms: f64,
-    /// 99th percentile ping time in milliseconds
-    p99_ms: f64,
-    /// Maximum ping time in milliseconds
-    max_ms: f64,
+    /// Unix epoch timestamp when the measurement was taken
+    timestamp: u64,
+    /// Average ping time in microseconds
+    avg_microsecs: i64,
+    /// Median ping time in microseconds
+    median_microsecs: i64,
+    /// 95th percentile ping time in microseconds
+    p95_microsecs: i64,
+    /// 99th percentile ping time in microseconds
+    p99_microsecs: i64,
+    /// Maximum ping time in microseconds
+    max_microsecs: i64,
     /// Number of hosts that failed to respond
     non_responsive_nodes: usize,
     /// Total number of hosts tested
@@ -62,7 +64,7 @@ struct Statistics {
 
 #[derive(Debug)]
 struct HostResult {
-    best_time_ms: Option<f64>,
+    best_time_microsecs: Option<f64>,
 }
 
 #[tokio::main]
@@ -126,12 +128,17 @@ async fn main() -> Result<()> {
 
     if hosts.is_empty() {
         warn!("No hosts provided on stdin");
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let stats = Statistics {
-            avg_ms: 0.0,
-            median_ms: 0.0,
-            p95_ms: 0.0,
-            p99_ms: 0.0,
-            max_ms: 0.0,
+            timestamp,
+            avg_microsecs: 0,
+            median_microsecs: 0,
+            p95_microsecs: 0,
+            p99_microsecs: 0,
+            max_microsecs: 0,
             non_responsive_nodes: 0,
             total_hosts: 0,
             pings_per_host: args.count,
@@ -203,19 +210,19 @@ async fn ping_host(host: &str, count: usize, timeout_duration: Duration) -> Host
         Ok(c) => c,
         Err(e) => {
             error!("Failed to create ping client for {}: {}", host, e);
-            return HostResult { best_time_ms: None };
+            return HostResult { best_time_microsecs: None };
         }
     };
 
-    let mut min_time_ms: Option<f64> = None;
+    let mut min_time_microsecs: Option<f64> = None;
     let mut successful_pings = 0;
 
     for i in 0..count {
         match timeout(timeout_duration, ping_once(&client, host, i as u16)).await {
             Ok(Ok(rtt)) => {
-                let rtt_ms = rtt.as_secs_f64() * 1000.0;
-                debug!("Host {} ping #{}: {:.2}ms", host, i + 1, rtt_ms);
-                min_time_ms = Some(min_time_ms.map_or(rtt_ms, |min| min.min(rtt_ms)));
+                let rtt_microsecs = rtt.as_secs_f64() * 1_000_000.0;
+                debug!("Host {} ping #{}: {:.0}µs", host, i + 1, rtt_microsecs);
+                min_time_microsecs = Some(min_time_microsecs.map_or(rtt_microsecs, |min| min.min(rtt_microsecs)));
                 successful_pings += 1;
             }
             Ok(Err(e)) => {
@@ -227,9 +234,9 @@ async fn ping_host(host: &str, count: usize, timeout_duration: Duration) -> Host
         }
     }
 
-    if let Some(best) = min_time_ms {
+    if let Some(best) = min_time_microsecs {
         info!(
-            "Host {} best time: {:.2}ms ({}/{} successful)",
+            "Host {} best time: {:.0}µs ({}/{} successful)",
             host, best, successful_pings, count
         );
     } else {
@@ -237,7 +244,7 @@ async fn ping_host(host: &str, count: usize, timeout_duration: Duration) -> Host
     }
 
     HostResult {
-        best_time_ms: min_time_ms,
+        best_time_microsecs: min_time_microsecs,
     }
 }
 
@@ -266,18 +273,24 @@ fn calculate_statistics(
     timeout_secs: f64,
     location: Option<Location>,
 ) -> Statistics {
-    let mut successful_times: Vec<f64> = results.iter().filter_map(|r| r.best_time_ms).collect();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
 
-    let non_responsive_nodes = results.iter().filter(|r| r.best_time_ms.is_none()).count();
+    let mut successful_times: Vec<f64> = results.iter().filter_map(|r| r.best_time_microsecs).collect();
+
+    let non_responsive_nodes = results.iter().filter(|r| r.best_time_microsecs.is_none()).count();
     let total_hosts = results.len();
 
     if successful_times.is_empty() {
         return Statistics {
-            avg_ms: 0.0,
-            median_ms: 0.0,
-            p95_ms: 0.0,
-            p99_ms: 0.0,
-            max_ms: 0.0,
+            timestamp,
+            avg_microsecs: 0,
+            median_microsecs: 0,
+            p95_microsecs: 0,
+            p99_microsecs: 0,
+            max_microsecs: 0,
             non_responsive_nodes,
             total_hosts,
             pings_per_host,
@@ -288,18 +301,20 @@ fn calculate_statistics(
 
     successful_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-    let avg_ms = successful_times.iter().sum::<f64>() / successful_times.len() as f64;
-    let median_ms = percentile(&successful_times, 50.0);
-    let p95_ms = percentile(&successful_times, 95.0);
-    let p99_ms = percentile(&successful_times, 99.0);
-    let max_ms = *successful_times.last().unwrap();
+    let avg_microsecs =
+        (successful_times.iter().sum::<f64>() / successful_times.len() as f64).round() as i64;
+    let median_microsecs = percentile(&successful_times, 50.0).round() as i64;
+    let p95_microsecs = percentile(&successful_times, 95.0).round() as i64;
+    let p99_microsecs = percentile(&successful_times, 99.0).round() as i64;
+    let max_microsecs = successful_times.last().unwrap().round() as i64;
 
     Statistics {
-        avg_ms,
-        median_ms,
-        p95_ms,
-        p99_ms,
-        max_ms,
+        timestamp,
+        avg_microsecs,
+        median_microsecs,
+        p95_microsecs,
+        p99_microsecs,
+        max_microsecs,
         non_responsive_nodes,
         total_hosts,
         pings_per_host,

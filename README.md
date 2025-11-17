@@ -84,17 +84,22 @@ The output is a single-line JSON object with the following fields:
 
 ```json
 {
-  "avg_ms": 4.23,
-  "median_ms": 4.17,
-  "p95_ms": 4.63,
-  "p99_ms": 4.63,
-  "max_ms": 4.63,
+  "timestamp": 1763421627,
+  "avg_microsecs": 4235,
+  "median_microsecs": 4567,
+  "p95_microsecs": 5123,
+  "p99_microsecs": 5234,
+  "max_microsecs": 5345,
   "non_responsive_nodes": 0,
   "total_hosts": 2,
   "pings_per_host": 3,
   "timeout_secs": 2.0
 }
 ```
+
+**Field descriptions:**
+- `timestamp`: Unix epoch timestamp (seconds) when the measurement was taken
+- `*_microsecs` fields: All latency values in microseconds, rounded to the nearest integer
 
 **Note:** The `location` field is only included when using the `-g/--geo` flag:
 
@@ -214,8 +219,8 @@ cat hosts.txt | rollping -g >> latency-log.jsonl
 ### Quick Network Health Check
 
 ```bash
-# Check common DNS servers
-echo -e "8.8.8.8\n8.8.4.4\n1.1.1.1\n1.0.0.1" | rollping | jq .avg_ms
+# Check common DNS servers (output in microseconds)
+echo -e "8.8.8.8\n8.8.4.4\n1.1.1.1\n1.0.0.1" | rollping | jq .avg_microsecs
 ```
 
 ## Requirements
