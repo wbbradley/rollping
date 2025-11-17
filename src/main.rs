@@ -1,9 +1,15 @@
+mod geoip;
+
+use std::{
+    io::{self, BufRead},
+    net::ToSocketAddrs,
+    time::Duration,
+};
+
 use anyhow::Result;
 use clap::Parser;
+use geoip::{GeoIpClient, Location};
 use serde::{Deserialize, Serialize};
-use std::io::{self, BufRead};
-use std::net::ToSocketAddrs;
-use std::time::Duration;
 use surge_ping::{Client, Config, PingIdentifier, PingSequence};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
@@ -41,11 +47,13 @@ struct Statistics {
     pings_per_host: usize,
     /// Timeout in seconds for each ping
     timeout_secs: f64,
+    /// Geolocation of the current machine
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<Location>,
 }
 
 #[derive(Debug)]
 struct HostResult {
-    host: String,
     best_time_ms: Option<f64>,
 }
 
@@ -57,12 +65,41 @@ async fn main() -> Result<()> {
         .with_target(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
     let args = Args::parse();
-    info!("Starting rollping with {} pings per host, {}s timeout", args.count, args.timeout_secs);
+    info!(
+        "Starting rollping with {} pings per host, {}s timeout",
+        args.count, args.timeout_secs
+    );
+
+    // Initialize geolocation
+    let geoip_client = GeoIpClient::new();
+    let location = if geoip_client.is_available() {
+        match geoip::get_public_ip() {
+            Ok(ip) => {
+                info!("Detected public IP: {}", ip);
+                geoip_client.lookup(ip)
+            }
+            Err(e) => {
+                warn!("Failed to detect public IP: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref loc) = location {
+        info!(
+            "Current location: {:?}, {:?}, {:?}",
+            loc.city.as_deref().unwrap_or("Unknown"),
+            loc.country.as_deref().unwrap_or("Unknown"),
+            loc.country_code.as_deref().unwrap_or("??")
+        );
+    }
 
     // Read hosts from stdin
     let hosts = read_hosts_from_stdin()?;
@@ -80,6 +117,7 @@ async fn main() -> Result<()> {
             total_hosts: 0,
             pings_per_host: args.count,
             timeout_secs: args.timeout_secs,
+            location: location.clone(),
         };
         println!("{}", serde_json::to_string(&stats)?);
         return Ok(());
@@ -90,8 +128,11 @@ async fn main() -> Result<()> {
     let results = ping_hosts(&hosts, args.count, timeout_duration).await;
 
     // Calculate statistics
-    let stats = calculate_statistics(&results, args.count, args.timeout_secs);
-    info!("Completed pinging {} hosts, {} non-responsive", stats.total_hosts, stats.non_responsive_nodes);
+    let stats = calculate_statistics(&results, args.count, args.timeout_secs, location);
+    info!(
+        "Completed pinging {} hosts, {} non-responsive",
+        stats.total_hosts, stats.non_responsive_nodes
+    );
 
     // Output JSON to stdout
     println!("{}", serde_json::to_string(&stats)?);
@@ -118,9 +159,7 @@ async fn ping_hosts(hosts: &[String], count: usize, timeout_duration: Duration) 
 
     for host in hosts {
         let host = host.clone();
-        let handle = tokio::spawn(async move {
-            ping_host(&host, count, timeout_duration).await
-        });
+        let handle = tokio::spawn(async move { ping_host(&host, count, timeout_duration).await });
         handles.push(handle);
     }
 
@@ -145,10 +184,7 @@ async fn ping_host(host: &str, count: usize, timeout_duration: Duration) -> Host
         Ok(c) => c,
         Err(e) => {
             error!("Failed to create ping client for {}: {}", host, e);
-            return HostResult {
-                host: host.to_string(),
-                best_time_ms: None,
-            };
+            return HostResult { best_time_ms: None };
         }
     };
 
@@ -156,10 +192,7 @@ async fn ping_host(host: &str, count: usize, timeout_duration: Duration) -> Host
     let mut successful_pings = 0;
 
     for i in 0..count {
-        match timeout(
-            timeout_duration,
-            ping_once(&client, host, i as u16)
-        ).await {
+        match timeout(timeout_duration, ping_once(&client, host, i as u16)).await {
             Ok(Ok(rtt)) => {
                 let rtt_ms = rtt.as_secs_f64() * 1000.0;
                 debug!("Host {} ping #{}: {:.2}ms", host, i + 1, rtt_ms);
@@ -176,13 +209,15 @@ async fn ping_host(host: &str, count: usize, timeout_duration: Duration) -> Host
     }
 
     if let Some(best) = min_time_ms {
-        info!("Host {} best time: {:.2}ms ({}/{} successful)", host, best, successful_pings, count);
+        info!(
+            "Host {} best time: {:.2}ms ({}/{} successful)",
+            host, best, successful_pings, count
+        );
     } else {
         warn!("Host {} failed all pings", host);
     }
 
     HostResult {
-        host: host.to_string(),
         best_time_ms: min_time_ms,
     }
 }
@@ -198,17 +233,21 @@ async fn ping_once(client: &Client, host: &str, seq: u16) -> Result<Duration> {
     let mut pinger = client.pinger(ip_addr, PingIdentifier(rand::random())).await;
 
     let payload = [0; 8];
-    let (_packet, duration) = pinger.ping(PingSequence(seq), &payload).await
+    let (_packet, duration) = pinger
+        .ping(PingSequence(seq), &payload)
+        .await
         .map_err(|e| anyhow::anyhow!("Ping failed: {}", e))?;
 
     Ok(duration)
 }
 
-fn calculate_statistics(results: &[HostResult], pings_per_host: usize, timeout_secs: f64) -> Statistics {
-    let mut successful_times: Vec<f64> = results
-        .iter()
-        .filter_map(|r| r.best_time_ms)
-        .collect();
+fn calculate_statistics(
+    results: &[HostResult],
+    pings_per_host: usize,
+    timeout_secs: f64,
+    location: Option<Location>,
+) -> Statistics {
+    let mut successful_times: Vec<f64> = results.iter().filter_map(|r| r.best_time_ms).collect();
 
     let non_responsive_nodes = results.iter().filter(|r| r.best_time_ms.is_none()).count();
     let total_hosts = results.len();
@@ -224,6 +263,7 @@ fn calculate_statistics(results: &[HostResult], pings_per_host: usize, timeout_s
             total_hosts,
             pings_per_host,
             timeout_secs,
+            location,
         };
     }
 
@@ -245,6 +285,7 @@ fn calculate_statistics(results: &[HostResult], pings_per_host: usize, timeout_s
         total_hosts,
         pings_per_host,
         timeout_secs,
+        location,
     }
 }
 
