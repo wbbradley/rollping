@@ -25,6 +25,14 @@ struct Args {
     /// Timeout in seconds for each ping
     #[arg(short = 't', long, default_value = "2.0")]
     timeout_secs: f64,
+
+    /// Increase logging verbosity (-v for WARN, -vv for INFO)
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Enable geolocation (fetches and includes location data)
+    #[arg(short = 'g', long = "geo")]
+    geo: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,47 +67,58 @@ struct HostResult {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // Determine log level based on verbosity flag
+    let log_level = match args.verbose {
+        0 => "error",
+        1 => "warn",
+        _ => "info",
+    };
+
     // Initialize tracing to stderr with RUST_LOG support
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
         .with_target(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
         )
         .init();
-
-    let args = Args::parse();
     info!(
         "Starting rollping with {} pings per host, {}s timeout",
         args.count, args.timeout_secs
     );
 
-    // Initialize geolocation
-    let geoip_client = GeoIpClient::new();
-    let location = if geoip_client.is_available() {
-        match geoip::get_public_ip() {
-            Ok(ip) => {
-                info!("Detected public IP: {}", ip);
-                geoip_client.lookup(ip)
+    // Initialize geolocation (only if --geo flag is set)
+    let location = if args.geo {
+        let geoip_client = GeoIpClient::new();
+        if geoip_client.is_available() {
+            match geoip::get_public_ip() {
+                Ok(ip) => {
+                    info!("Detected public IP: {}", ip);
+                    let loc = geoip_client.lookup(ip);
+                    if let Some(ref l) = loc {
+                        info!(
+                            "Current location: {:?}, {:?}, {:?}",
+                            l.city.as_deref().unwrap_or("Unknown"),
+                            l.country.as_deref().unwrap_or("Unknown"),
+                            l.country_code.as_deref().unwrap_or("??")
+                        );
+                    }
+                    loc
+                }
+                Err(e) => {
+                    warn!("Failed to detect public IP: {}", e);
+                    None
+                }
             }
-            Err(e) => {
-                warn!("Failed to detect public IP: {}", e);
-                None
-            }
+        } else {
+            None
         }
     } else {
         None
     };
-
-    if let Some(ref loc) = location {
-        info!(
-            "Current location: {:?}, {:?}, {:?}",
-            loc.city.as_deref().unwrap_or("Unknown"),
-            loc.country.as_deref().unwrap_or("Unknown"),
-            loc.country_code.as_deref().unwrap_or("??")
-        );
-    }
 
     // Read hosts from stdin
     let hosts = read_hosts_from_stdin()?;
