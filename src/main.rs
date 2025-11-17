@@ -51,10 +51,14 @@ struct HostResult {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing to stderr
+    // Initialize tracing to stderr with RUST_LOG support
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
         .with_target(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        )
         .init();
 
     let args = Args::parse();
@@ -77,7 +81,7 @@ async fn main() -> Result<()> {
             pings_per_host: args.count,
             timeout_secs: args.timeout_secs,
         };
-        println!("{}", serde_json::to_string_pretty(&stats)?);
+        println!("{}", serde_json::to_string(&stats)?);
         return Ok(());
     }
 
@@ -90,7 +94,7 @@ async fn main() -> Result<()> {
     info!("Completed pinging {} hosts, {} non-responsive", stats.total_hosts, stats.non_responsive_nodes);
 
     // Output JSON to stdout
-    println!("{}", serde_json::to_string_pretty(&stats)?);
+    println!("{}", serde_json::to_string(&stats)?);
 
     Ok(())
 }
